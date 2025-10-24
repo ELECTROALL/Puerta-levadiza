@@ -1,0 +1,294 @@
+#include <EEPROM.h>
+
+// Display 7 segmentos (74HC595)
+#define DATA_PIN 23
+#define LATCH_PIN 21
+#define CLOCK_PIN 22
+
+// Pines
+#define PIN_HALL_A 27
+#define PIN_HALL_B 33
+#define PIN_MOTOR_ARRIBA 13
+#define PIN_MOTOR_ABAJO 12
+#define PIN_MOSFET_PWM 25
+#define SEGURO_CHAPA 26
+#define PIN_CORRIENTE 36
+
+// Pines del CONTROL REMOTO (ACTIVOS EN HIGH)
+#define PIN_ABRIR 16
+#define PIN_CERRAR 4
+#define PIN_AUX1 2
+#define PIN_AUX2 15
+
+// Variables globales
+volatile long CONTADOR_DE_PULSOS = 0;
+volatile int estadoAnteriorA = 0;
+volatile int estadoAnteriorB = 0;
+
+long PULSOS_APERTURA_COMPLETA = 1500;  // Límite fijo de apertura
+long PULSOS_CIERRE_COMPLETA = 0;       // Límite fijo de cierre
+
+bool motorEncendido = false;
+bool motorAperturaActivo = false;
+bool motorCierreActivo = false;
+
+// Segmentos para números y letras (ÁNODO COMÚN)
+byte numeros[10] = {
+  0b00000011, // 0
+  0b11111001, // 1
+  0b10100100, // 2
+  0b10110000, // 3
+  0b10011001, // 4
+  0b10010010, // 5
+  0b10000010, // 6
+  0b11111000, // 7
+  0b10000000, // 8
+  0b10010000  // 9
+};
+const byte DIGITO_C = 0b01100011;    // "C"
+const byte DIGITO_A = 0b00010001;    // "A"
+const byte DISPLAY_OFF = 0b11111111; // Display apagado
+
+// Variables de control remoto
+unsigned long ultimaAccionRemoto = 0;
+#define TIEMPO_ENTRE_ACCIONES 1000
+
+// Variables para seguridad
+#define LIMITE_DE_CORRIENTE 300
+#define TIEMPO_ESPERA_REVERSA 500
+#define TIEMPO_ARRANQUE_PROGRESIVO 2000
+
+float corrienteFiltrada = 0;
+const float FACTOR_SUAVIZADO = 0.3;
+unsigned long ultimaLecturaCorriente = 0;
+#define INTERVALO_LECTURA_CORRIENTE 100
+
+bool seguridadActiva = false;
+unsigned long tiempoInicioMovimiento = 0;
+bool obstruccionDetectada = false;
+
+// Variables interrupción
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// ---------------------- FUNCIONES ----------------------
+
+void escribirDisplay(byte caracter) {
+  digitalWrite(LATCH_PIN, LOW);
+  shiftOut(DATA_PIN, CLOCK_PIN, LSBFIRST, caracter);
+  digitalWrite(LATCH_PIN, HIGH);
+}
+
+void actualizarDisplay() {
+  if (seguridadActiva) {
+    static unsigned long ultimoCambio = 0;
+    static bool estado = false;
+    if (millis() - ultimoCambio > 500) {
+      estado = !estado;
+      ultimoCambio = millis();
+    }
+    escribirDisplay(estado ? numeros[0] : DISPLAY_OFF);
+    return;
+  }
+
+  if (motorEncendido) {
+    if (motorAperturaActivo) escribirDisplay(DIGITO_A);
+    else if (motorCierreActivo) escribirDisplay(DIGITO_C);
+  } else {
+    escribirDisplay(DISPLAY_OFF);
+  }
+}
+
+void IRAM_ATTR interrupcionEncoder() {
+  portENTER_CRITICAL_ISR(&mux);
+  int A = digitalRead(PIN_HALL_A);
+  int B = digitalRead(PIN_HALL_B);
+  if (A != estadoAnteriorA) {
+    if (A == B) CONTADOR_DE_PULSOS--;
+    else CONTADOR_DE_PULSOS++;
+  }
+  estadoAnteriorA = A;
+  estadoAnteriorB = B;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void actualizarLecturaCorriente() {
+  if (millis() - ultimaLecturaCorriente < INTERVALO_LECTURA_CORRIENTE) return;
+  int lectura = analogRead(PIN_CORRIENTE);
+  corrienteFiltrada = (FACTOR_SUAVIZADO * lectura) + ((1 - FACTOR_SUAVIZADO) * corrienteFiltrada);
+  ultimaLecturaCorriente = millis();
+}
+
+void controlMotor(bool encender, bool esApertura) {
+  if (encender) {
+    if (esApertura) {
+      digitalWrite(SEGURO_CHAPA, HIGH);
+      delay(700);
+      digitalWrite(SEGURO_CHAPA, LOW);
+      digitalWrite(PIN_MOTOR_ARRIBA, HIGH);
+      digitalWrite(PIN_MOTOR_ABAJO, LOW);
+      motorAperturaActivo = true;
+      motorCierreActivo = false;
+    } else {
+      digitalWrite(PIN_MOTOR_ARRIBA, LOW);
+      digitalWrite(PIN_MOTOR_ABAJO, HIGH);
+      motorAperturaActivo = false;
+      motorCierreActivo = true;
+    }
+
+    motorEncendido = true;
+    tiempoInicioMovimiento = millis();
+
+    for (int i = 0; i <= 255; i++) {
+      analogWrite(PIN_MOSFET_PWM, i);
+      delay(8);
+    }
+  } else {
+    analogWrite(PIN_MOSFET_PWM, 0);
+    digitalWrite(PIN_MOTOR_ARRIBA, LOW);
+    digitalWrite(PIN_MOTOR_ABAJO, LOW);
+    motorEncendido = false;
+    motorAperturaActivo = false;
+    motorCierreActivo = false;
+    if (!seguridadActiva) obstruccionDetectada = false;
+  }
+}
+
+void verificarSeguridadObstruccion() {
+  if (!motorEncendido || seguridadActiva) return;
+  if (millis() - tiempoInicioMovimiento < TIEMPO_ARRANQUE_PROGRESIVO) return;
+  if (corrienteFiltrada >= LIMITE_DE_CORRIENTE && !obstruccionDetectada) {
+    obstruccionDetectada = true;
+    seguridadActiva = true;
+    Serial.println("⚠️ OBSTRUCCIÓN DETECTADA - REVERSA");
+    bool estabaAbriendo = motorAperturaActivo;
+    controlMotor(false, true);
+    delay(TIEMPO_ESPERA_REVERSA);
+    controlMotor(true, !estabaAbriendo);
+  }
+}
+
+void controlVelocidadProgresiva() {
+  if (!motorEncendido || seguridadActiva) return;
+  portENTER_CRITICAL(&mux);
+  long pulsos = CONTADOR_DE_PULSOS;
+  portEXIT_CRITICAL(&mux);
+  int pwm = 255;
+
+  if (motorAperturaActivo) {
+    long restantes = PULSOS_APERTURA_COMPLETA - pulsos;
+    float porc = (float)restantes / PULSOS_APERTURA_COMPLETA * 100.0;
+    if (porc <= 15.0) {
+      pwm = map(porc, 0, 15, 30, 255);
+      pwm = constrain(pwm, 30, 255);
+    }
+  } else if (motorCierreActivo) {
+    long restantes = pulsos - PULSOS_CIERRE_COMPLETA;
+    float porc = (float)restantes / PULSOS_APERTURA_COMPLETA * 100.0;
+    if (porc <= 15.0) {
+      pwm = map(porc, 0, 15, 30, 255);
+      pwm = constrain(pwm, 30, 255);
+    }
+  }
+
+  analogWrite(PIN_MOSFET_PWM, pwm);
+}
+
+void verificarLimitesAutomaticos() {
+  if (!motorEncendido) return;
+  portENTER_CRITICAL(&mux);
+  long pulsos = CONTADOR_DE_PULSOS;
+  portEXIT_CRITICAL(&mux);
+
+  if (motorAperturaActivo && pulsos >= PULSOS_APERTURA_COMPLETA) {
+    Serial.println("Límite de apertura alcanzado");
+    controlMotor(false, true);
+    seguridadActiva = false;
+    obstruccionDetectada = false;
+  }
+  if (motorCierreActivo && pulsos <= PULSOS_CIERRE_COMPLETA) {
+    Serial.println("Límite de cierre alcanzado");
+    controlMotor(false, false);
+    seguridadActiva = false;
+    obstruccionDetectada = false;
+  }
+}
+
+void controlMotorRemoto(bool esApertura) {
+  if (esApertura && CONTADOR_DE_PULSOS < PULSOS_APERTURA_COMPLETA) {
+    Serial.println("REMOTO: Apertura");
+    controlMotor(true, true);
+  } else if (!esApertura && CONTADOR_DE_PULSOS > PULSOS_CIERRE_COMPLETA) {
+    Serial.println("REMOTO: Cierre");
+    controlMotor(true, false);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("SISTEMA: Iniciando puerta cochera (modo fijo)");
+
+  pinMode(DATA_PIN, OUTPUT);
+  pinMode(LATCH_PIN, OUTPUT);
+  pinMode(CLOCK_PIN, OUTPUT);
+
+  pinMode(PIN_HALL_A, INPUT_PULLUP);
+  pinMode(PIN_HALL_B, INPUT_PULLUP);
+  pinMode(PIN_MOTOR_ARRIBA, OUTPUT);
+  pinMode(PIN_MOTOR_ABAJO, OUTPUT);
+  pinMode(PIN_MOSFET_PWM, OUTPUT);
+  pinMode(SEGURO_CHAPA, OUTPUT);
+  pinMode(PIN_ABRIR, INPUT);
+  pinMode(PIN_CERRAR, INPUT);
+  pinMode(PIN_AUX1, INPUT);
+  pinMode(PIN_AUX2, INPUT);
+  pinMode(PIN_CORRIENTE, INPUT);
+
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL_A), interrupcionEncoder, CHANGE);
+
+  digitalWrite(PIN_MOTOR_ARRIBA, LOW);
+  digitalWrite(PIN_MOTOR_ABAJO, LOW);
+  analogWrite(PIN_MOSFET_PWM, 0);
+
+  corrienteFiltrada = analogRead(PIN_CORRIENTE);
+  escribirDisplay(DISPLAY_OFF);
+
+  Serial.print("Límites fijos: APERTURA=");
+  Serial.println(PULSOS_APERTURA_COMPLETA);
+}
+
+void loop() {
+  actualizarLecturaCorriente();
+  actualizarDisplay();
+
+  if (digitalRead(PIN_ABRIR) == HIGH && !motorEncendido && !seguridadActiva) {
+    if (millis() - ultimaAccionRemoto > TIEMPO_ENTRE_ACCIONES) {
+      controlMotorRemoto(true);
+      ultimaAccionRemoto = millis();
+    }
+  }
+
+  if (digitalRead(PIN_CERRAR) == HIGH && !motorEncendido && !seguridadActiva) {
+    if (millis() - ultimaAccionRemoto > TIEMPO_ENTRE_ACCIONES) {
+      controlMotorRemoto(false);
+      ultimaAccionRemoto = millis();
+    }
+  }
+
+  if (motorEncendido && !seguridadActiva) controlVelocidadProgresiva();
+  verificarSeguridadObstruccion();
+  verificarLimitesAutomaticos();
+
+  static unsigned long ultimoReporte = 0;
+  if (millis() - ultimoReporte > 1000) {
+    portENTER_CRITICAL(&mux);
+    long pulsos = CONTADOR_DE_PULSOS;
+    portEXIT_CRITICAL(&mux);
+    Serial.print("Pulsos:");
+    Serial.print(pulsos);
+    Serial.print(" | Corriente:");
+    Serial.print(corrienteFiltrada);
+    Serial.print(" | Seguridad:");
+    Serial.println(seguridadActiva ? "ACTIVA" : "INACTIVA");
+    ultimoReporte = millis();
+  }
+}
